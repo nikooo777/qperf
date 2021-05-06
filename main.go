@@ -6,7 +6,6 @@ import (
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -16,15 +15,12 @@ import (
 	"math/big"
 	"net"
 	"net/http"
-	"os"
+	_ "net/http/pprof"
 	"strconv"
 	"sync/atomic"
 	"time"
 
-	_ "net/http/pprof"
-
 	quic "github.com/lucas-clemente/quic-go"
-	"github.com/lucas-clemente/quic-go/quictrace"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -159,43 +155,19 @@ func (c *bandwidthCounter) FinalReport() (startTime time.Time, n uint64) {
 	return c.startTime, atomic.LoadUint64(&c.counter)
 }
 
-func exportTraces(tracer quictrace.Tracer) error {
-	traces := tracer.GetAllTraces()
-	if len(traces) != 1 {
-		return errors.New("expected exactly one trace")
-	}
-	for _, trace := range traces {
-		f, err := os.Create("trace.qtr")
-		if err != nil {
-			return err
-		}
-		if _, err := f.Write(trace); err != nil {
-			return err
-		}
-		f.Close()
-		fmt.Println("Wrote trace to", f.Name())
-	}
-	return nil
-}
-
 func runServer(port int, bufferSize int64, windowSize int64, trace bool) error {
 	tlsConf, err := getTLSConfig()
 	if err != nil {
 		return err
 	}
 	tlsConf.NextProtos = []string{"qperf"}
-	var tracer quictrace.Tracer
-	if trace {
-		tracer = quictrace.NewTracer()
-	}
 	ln, err := quic.ListenAddr(
 		fmt.Sprintf("0.0.0.0:%d", port),
 		tlsConf,
 		&quic.Config{
-			MaxReceiveStreamFlowControlWindow:     uint64(windowSize),
-			MaxReceiveConnectionFlowControlWindow: uint64(windowSize),
-			QuicTracer:                            tracer,
-			AcceptToken:                           func(net.Addr, *quic.Token) bool { return true },
+			AcceptToken:                func(net.Addr, *quic.Token) bool { return true },
+			MaxStreamReceiveWindow:     uint64(windowSize),
+			MaxConnectionReceiveWindow: uint64(windowSize),
 		},
 	)
 	if err != nil {
@@ -233,20 +205,11 @@ func runServer(port int, bufferSize int64, windowSize int64, trace bool) error {
 	}
 
 	err = g.Wait()
-	if trace {
-		if err := exportTraces(tracer); err != nil {
-			return err
-		}
-	}
 	return err
 }
 
 func runClient(address string, port int, duration time.Duration, numStreams int, bufferSize int64, trace bool) error {
 	fmt.Printf("Connecting to host %s, port %d\n", address, port)
-	var tracer quictrace.Tracer
-	if trace {
-		tracer = quictrace.NewTracer()
-	}
 	sess, err := quic.DialAddr(
 		fmt.Sprintf("%s:%d", address, port),
 		&tls.Config{
@@ -255,17 +218,11 @@ func runClient(address string, port int, duration time.Duration, numStreams int,
 		},
 		&quic.Config{
 			MaxIncomingUniStreams: 1000,
-			QuicTracer:            tracer,
 		},
 	)
 	if err != nil {
 		return err
 	}
-
-	timer := time.AfterFunc(duration, func() {
-		sess.Close()
-	})
-	defer timer.Stop()
 
 	var bc bandwidthCounter
 	go bc.Run(sess.Context().Done())
@@ -289,11 +246,6 @@ func runClient(address string, port int, duration time.Duration, numStreams int,
 	}
 
 	err = g.Wait()
-	if trace {
-		if err := exportTraces(tracer); err != nil {
-			return err
-		}
-	}
 	return err
 }
 
